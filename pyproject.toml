@@ -33,3 +33,7 @@ packages = ["src/withdrawals"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
