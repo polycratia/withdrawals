@@ -5,8 +5,8 @@ on-chain, stay idempotent when the callback arrives twice.
 
 ## Status
 
-Pre-alpha. The withdrawal request, its state machine and the routing decision
-are in place; the senders are not implemented yet.
+Pre-alpha. The withdrawal request, its state machine, the routing decision and
+idempotent submission are in place; the senders are not implemented yet.
 
 ## Installation
 
@@ -78,6 +78,33 @@ assert not decision.needs_confirmations
 Any destination custody does not recognise routes `EXTERNAL` and settles only
 once the chain confirms it. Supply your own custody lookup by implementing
 `account_for(destination) -> str | None`.
+
+## Idempotent submission
+
+A client that does not hear back retries. Every submission carries a request
+key the client chooses: the first call under a key runs the send, every later
+call returns what that first one produced, and the rail is touched once.
+
+```python
+from withdrawals import Submissions
+
+submissions = Submissions()
+
+def send(pending):
+    return pending.approve().start_sending().mark_sent("0xdeadbeef")
+
+first = submissions.submit("client-req-9f21", request, send)
+again = submissions.submit("client-req-9f21", request, send)
+
+assert again is first
+```
+
+The same key carrying a different withdrawal raises `IdempotencyConflict`
+instead of paying twice. When the send itself raises, the key stays claimed and
+a retry raises `SubmissionInFlight`, because nobody knows yet whether the rail
+saw it: close it with `resolve(key, outcome)` once it has been reconciled, or
+`release(key)` when it is certain nothing moved. The ledger lives in the
+process that owns it.
 
 ## Tests
 
