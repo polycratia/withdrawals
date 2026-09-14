@@ -5,8 +5,9 @@ on-chain, stay idempotent when the callback arrives twice.
 
 ## Status
 
-Pre-alpha. The withdrawal request, its state machine, the routing decision and
-idempotent submission are in place; the senders are not implemented yet.
+Pre-alpha. The withdrawal request, its state machine, the approval gate, the
+routing decision and idempotent submission are in place; the senders are not
+implemented yet.
 
 ## Installation
 
@@ -37,6 +38,7 @@ request = WithdrawalRequest(
     amount=Decimal("25.00"),
     currency="USDC",
     destination="0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f",
+    requested_by="alice",
 )
 
 sent = request.approve().start_sending().mark_sent("0xdeadbeef")
@@ -55,6 +57,50 @@ assert sent.mark_sent("0xdeadbeef") is sent
 
 A replay carrying different data is a conflict, not a silent overwrite, and
 raises `InvalidTransition` — as does any step the state machine does not allow.
+
+## Approval
+
+The amount decides how many people it takes. A policy is a set of rules, each
+with the amount it starts at and the number of distinct approvers it asks for;
+the rule with the highest threshold the amount clears is the one that applies.
+
+```python
+from withdrawals import ApprovalPolicy, approve, ensure_approved
+
+policy = ApprovalPolicy.four_eyes(above=Decimal("1000"))
+
+large = WithdrawalRequest(
+    id="w-1042",
+    amount=Decimal("5000.00"),
+    currency="USDC",
+    destination="0xab5801a7d398351b8be11c439e05c5b3259aec9b",
+    requested_by="alice",
+)
+
+waiting = approve(large, "bob", policy)
+assert waiting.state is WithdrawalState.REQUESTED
+
+approved = approve(waiting, "carol", policy)
+assert approved.state is WithdrawalState.APPROVED
+assert approved.approvers == ("bob", "carol")
+assert approved.approvals[0].policy == "four-eyes"
+```
+
+Every approval names who gave it, when they gave it (timezone-aware) and the
+rule that was in force at the time, and it travels with the request all the way
+to `confirmed`. The person who asked for the money cannot be one of the
+approvers (`SelfApproval`), and the same approver recorded twice counts once,
+so a click that arrives twice never becomes a second pair of eyes.
+
+`request.approve()` is the bare state move; `approve(request, who, policy)` is
+the one that asks the policy first. Build your own rules with `ApprovalRule`
+when two tiers are not enough — a policy needs one rule starting at zero, so
+that every amount matches exactly one.
+
+Before handing a request to a rail, `ensure_approved(request, policy)` measures
+it against the policy again and raises `NotApproved` when the signatures behind
+it no longer suffice: thresholds change, and a request approved yesterday under
+a looser rule should not slip out today.
 
 ## Routing
 

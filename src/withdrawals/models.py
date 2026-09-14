@@ -5,16 +5,21 @@ leaves the pipeline through rejected or failed. States are plain data: every
 transition returns a new request and the caller decides where to store it.
 Replaying a transition that already happened returns the same value, so a
 callback delivered twice changes nothing.
+
+Approvals travel with the request: each one names who gave it, when they gave
+it and which policy rule was in force at the time.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Any
 
 __all__ = [
+    "Approval",
     "InvalidTransition",
     "WithdrawalError",
     "WithdrawalRequest",
@@ -74,6 +79,25 @@ _TRANSITIONS: dict[WithdrawalState, frozenset[WithdrawalState]] = {
 
 
 @dataclass(frozen=True, slots=True)
+class Approval:
+    """One person letting a withdrawal through, under one policy rule."""
+
+    approver: str
+    at: datetime
+    policy: str
+
+    def __post_init__(self) -> None:
+        approver = _require_text(self.approver, "approver").strip()
+        policy = _require_text(self.policy, "policy").strip()
+        if not isinstance(self.at, datetime):
+            raise TypeError("at must be a datetime")
+        if self.at.tzinfo is None or self.at.tzinfo.utcoffset(self.at) is None:
+            raise ValueError("at must be timezone-aware")
+        object.__setattr__(self, "approver", approver)
+        object.__setattr__(self, "policy", policy)
+
+
+@dataclass(frozen=True, slots=True)
 class WithdrawalRequest:
     """A single withdrawal as it moves through the pipeline.
 
@@ -88,6 +112,8 @@ class WithdrawalRequest:
     state: WithdrawalState = WithdrawalState.REQUESTED
     reference: str | None = None
     reason: str | None = None
+    requested_by: str | None = None
+    approvals: tuple[Approval, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -106,6 +132,13 @@ class WithdrawalRequest:
             raise ValueError("currency must be an alphanumeric ticker")
         if not isinstance(self.destination, str) or not self.destination.strip():
             raise ValueError("destination must be a non-empty string")
+        if self.requested_by is not None:
+            object.__setattr__(
+                self,
+                "requested_by",
+                _require_text(self.requested_by, "requested_by").strip(),
+            )
+        object.__setattr__(self, "approvals", _approvals(self.approvals))
         object.__setattr__(self, "currency", self.currency.upper())
         object.__setattr__(self, "state", WithdrawalState(self.state))
 
@@ -113,6 +146,24 @@ class WithdrawalRequest:
     def is_terminal(self) -> bool:
         """True once the request has confirmed, been rejected or failed."""
         return self.state.is_terminal
+
+    @property
+    def approvers(self) -> tuple[str, ...]:
+        """The people who have approved so far, in the order they did."""
+        return tuple(approval.approver for approval in self.approvals)
+
+    def record_approval(self, approval: Approval) -> WithdrawalRequest:
+        """Add one approval; the same approver recorded twice counts once."""
+        if not isinstance(approval, Approval):
+            raise TypeError("an approval must be an Approval")
+        if approval.approver in self.approvers:
+            return self
+        if self.state is not WithdrawalState.REQUESTED:
+            raise InvalidTransition(
+                f"withdrawal {self.id} is {self.state} "
+                f"and takes no further approvals"
+            )
+        return replace(self, approvals=self.approvals + (approval,))
 
     def approve(self) -> WithdrawalRequest:
         if self.state is WithdrawalState.APPROVED:
@@ -164,6 +215,18 @@ class WithdrawalRequest:
                     f"with a different {name}"
                 )
         return self
+
+
+def _approvals(values: tuple[Approval, ...]) -> tuple[Approval, ...]:
+    approvals = tuple(values)
+    seen: set[str] = set()
+    for approval in approvals:
+        if not isinstance(approval, Approval):
+            raise TypeError("approvals must be Approval values")
+        if approval.approver in seen:
+            raise ValueError("the same approver cannot appear twice")
+        seen.add(approval.approver)
+    return approvals
 
 
 def _require_text(value: str, name: str) -> str:
