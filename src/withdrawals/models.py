@@ -7,7 +7,9 @@ Replaying a transition that already happened returns the same value, so a
 callback delivered twice changes nothing.
 
 Approvals travel with the request: each one names who gave it, when they gave
-it and which policy rule was in force at the time.
+it and which policy rule was in force at the time. A transaction that has to be
+replaced travels with it too: the reference that got stuck moves to `replaced`,
+so a bumped or cancelled send keeps the attempts behind it.
 """
 
 from __future__ import annotations
@@ -114,6 +116,7 @@ class WithdrawalRequest:
     reason: str | None = None
     requested_by: str | None = None
     approvals: tuple[Approval, ...] = ()
+    replaced: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -139,6 +142,9 @@ class WithdrawalRequest:
                 _require_text(self.requested_by, "requested_by").strip(),
             )
         object.__setattr__(self, "approvals", _approvals(self.approvals))
+        object.__setattr__(self, "replaced", _references(self.replaced))
+        if self.reference is not None and self.reference in self.replaced:
+            raise ValueError("a reference cannot be current and replaced at once")
         object.__setattr__(self, "currency", self.currency.upper())
         object.__setattr__(self, "state", WithdrawalState(self.state))
 
@@ -189,6 +195,24 @@ class WithdrawalRequest:
             return self._replay(reference=reference)
         return self._move(WithdrawalState.SENT, reference=reference)
 
+    def bump(self, reference: str) -> WithdrawalRequest:
+        """Put a replacement in front of a transaction that is not moving."""
+        reference = _require_text(reference, "reference")
+        if self.state is not WithdrawalState.SENT:
+            raise InvalidTransition(
+                f"withdrawal {self.id} is {self.state} "
+                f"and has no transaction to replace"
+            )
+        if reference == self.reference:
+            return self
+        if reference in self.replaced:
+            raise InvalidTransition(
+                f"withdrawal {self.id} already replaced transaction {reference}"
+            )
+        return replace(
+            self, reference=reference, replaced=self.replaced + (self.reference,)
+        )
+
     def confirm(self) -> WithdrawalRequest:
         if self.state is WithdrawalState.CONFIRMED:
             return self
@@ -227,6 +251,16 @@ def _approvals(values: tuple[Approval, ...]) -> tuple[Approval, ...]:
             raise ValueError("the same approver cannot appear twice")
         seen.add(approval.approver)
     return approvals
+
+
+def _references(values: tuple[str, ...]) -> tuple[str, ...]:
+    references = tuple(values)
+    for reference in references:
+        if not isinstance(reference, str) or not reference.strip():
+            raise ValueError("a replaced reference must be a non-empty string")
+    if len(set(references)) != len(references):
+        raise ValueError("the same reference cannot be replaced twice")
+    return references
 
 
 def _require_text(value: str, name: str) -> str:

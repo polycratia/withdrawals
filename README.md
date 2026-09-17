@@ -6,8 +6,8 @@ on-chain, stay idempotent when the callback arrives twice.
 ## Status
 
 Pre-alpha. The withdrawal request, its state machine, the approval gate, the
-routing decision and idempotent submission are in place; the senders are not
-implemented yet.
+routing decision, idempotent submission and the failure paths that return funds
+are in place; the senders are not implemented yet.
 
 ## Installation
 
@@ -151,6 +151,60 @@ a retry raises `SubmissionInFlight`, because nobody knows yet whether the rail
 saw it: close it with `resolve(key, outcome)` once it has been reconciled, or
 `release(key)` when it is certain nothing moved. The ledger lives in the
 process that owns it.
+
+## Failure paths
+
+Money that does not leave has to come back. A rail that refuses a transaction
+says so by raising `BroadcastRejected`; `broadcast` fails the request and
+releases its hold in the same call.
+
+```python
+from withdrawals import BroadcastRejected, Hold, InMemoryHolds, broadcast
+
+holds = InMemoryHolds()
+holds.place(Hold.on(request))
+
+def refused(pending):
+    raise BroadcastRejected("insufficient gas")
+
+failed = broadcast(request.approve(), refused, holds)
+
+assert failed.state is WithdrawalState.FAILED
+assert failed.reason == "insufficient gas"
+assert holds.held(request.id) is None
+```
+
+Any other exception means nobody knows whether the transaction made it, so the
+hold stays and the error travels on: releasing funds that may still be moving
+is worse than holding them one reconciliation longer. Bring your own vault by
+implementing `release(withdrawal_id) -> bool`.
+
+A transaction that does not confirm is not forgotten either. `review` measures
+how long it has been waiting against a policy and hands back the decision, with
+its reason, as a value:
+
+```python
+from datetime import timedelta
+
+from withdrawals import Action, StuckPolicy, bump, cancel, review
+
+policy = StuckPolicy(bump_after=timedelta(minutes=10), cancel_after=timedelta(hours=2))
+
+decision = review(sent, sent_at=broadcast_at, policy=policy)
+
+if decision.action is Action.BUMP:
+    sent = bump(sent, "0xfeedface")
+elif decision.action is Action.CANCEL:
+    sent = cancel(sent, "0xcafebabe", holds, reason=decision.reason)
+```
+
+A bump keeps the transaction it replaced in `replaced`, so the attempts behind
+a send stay readable; a cancel records the replacement, fails the request and
+returns the hold. Both are free to repeat: bumping to the reference a request
+already carries returns the same request, and cancelling a cancelled one
+releases nothing a second time. A transaction that has been bumped as often as
+the policy allows is cancelled instead of bumped again, and an old reference
+that comes back after being replaced raises `InvalidTransition`.
 
 ## Tests
 
