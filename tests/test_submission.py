@@ -28,17 +28,64 @@ def make(**changes) -> WithdrawalRequest:
 class Sender:
     """A send that counts how often the rail was actually touched."""
 
-    def __init__(self, reference: str = "0xdeadbeef") -> None:
+    def __init__(self, reference: str = "0xdeadbeef", delay: float = 0.0) -> None:
         self.calls = 0
         self._reference = reference
+        self._delay = delay
+        self._lock = threading.Lock()
 
     def __call__(self, request: WithdrawalRequest) -> WithdrawalRequest:
-        self.calls += 1
+        with self._lock:
+            self.calls += 1
+        if self._delay:
+            time.sleep(self._delay)
         return request.approve().start_sending().mark_sent(self._reference)
+
+
+class Failing:
+    """A send that counts its attempts and never comes back with an outcome."""
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.calls = 0
+        self._delay = delay
+        self._lock = threading.Lock()
+
+    def __call__(self, request: WithdrawalRequest) -> WithdrawalRequest:
+        with self._lock:
+            self.calls += 1
+        if self._delay:
+            time.sleep(self._delay)
+        raise RuntimeError("rpc timeout")
 
 
 def boom(request: WithdrawalRequest) -> WithdrawalRequest:
     raise RuntimeError("rpc timeout")
+
+
+def race(count, task):
+    """Run `task(index)` in `count` threads released at the same moment."""
+    start = threading.Barrier(count)
+    lock = threading.Lock()
+    outcomes: list = []
+    errors: list[Exception] = []
+
+    def worker(index: int) -> None:
+        start.wait()
+        try:
+            outcome = task(index)
+        except Exception as error:
+            with lock:
+                errors.append(error)
+        else:
+            with lock:
+                outcomes.append(outcome)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return outcomes, errors
 
 
 def test_the_first_submission_sends():
@@ -160,9 +207,17 @@ def test_an_unknown_key_has_no_outcome():
 
 
 @pytest.mark.parametrize("key", ["", "   ", None, 7])
-def test_a_key_must_be_a_non_empty_string(key):
+def test_every_entry_point_needs_a_real_key(key):
+    ledger = Submissions()
+
     with pytest.raises(ValueError):
-        Submissions().submit(key, make())
+        ledger.submit(key, make())
+    with pytest.raises(ValueError):
+        ledger.outcome(key)
+    with pytest.raises(ValueError):
+        ledger.resolve(key, make())
+    with pytest.raises(ValueError):
+        ledger.release(key)
 
 
 def test_a_send_must_return_a_request():
@@ -180,32 +235,55 @@ def test_a_replay_is_logged(caplog):
     assert "req-1" in caplog.text
 
 
-def test_parallel_retries_send_once():
+def test_a_double_submit_under_one_key_touches_the_rail_once():
     ledger = Submissions()
     request = make()
-    sent = []
-    outcomes = []
-    in_flight = []
-    start = threading.Barrier(8)
+    sender = Sender(delay=0.05)
 
-    def send(pending: WithdrawalRequest) -> WithdrawalRequest:
-        time.sleep(0.05)
-        sent.append(pending)
-        return pending.approve().start_sending().mark_sent("0xdeadbeef")
+    outcomes, errors = race(8, lambda _: ledger.submit("req-1", request, sender))
 
-    def worker() -> None:
-        start.wait()
-        try:
-            outcomes.append(ledger.submit("req-1", request, send))
-        except SubmissionInFlight:
-            in_flight.append(True)
-
-    threads = [threading.Thread(target=worker) for _ in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert len(sent) == 1
-    assert len(outcomes) + len(in_flight) == 8
+    assert sender.calls == 1
+    assert len(outcomes) + len(errors) == 8
+    assert outcomes
     assert all(outcome is outcomes[0] for outcome in outcomes)
+    assert all(isinstance(error, SubmissionInFlight) for error in errors)
+    assert ledger.outcome("req-1") is outcomes[0]
+
+
+def test_two_withdrawals_racing_for_one_key_leave_one_conflict():
+    ledger = Submissions()
+    sender = Sender(delay=0.05)
+    requests = [make(), make(id="w-1042")]
+
+    outcomes, errors = race(2, lambda i: ledger.submit("req-1", requests[i], sender))
+
+    assert sender.calls == 1
+    assert len(outcomes) == 1
+    assert [type(error) for error in errors] == [IdempotencyConflict]
+
+
+def test_a_send_that_raises_under_load_keeps_the_key_from_everyone():
+    ledger = Submissions()
+    failing = Failing(delay=0.05)
+
+    outcomes, errors = race(6, lambda _: ledger.submit("req-1", make(), failing))
+
+    raised = [type(error) for error in errors]
+    assert not outcomes
+    assert failing.calls == 1
+    assert raised.count(RuntimeError) == 1
+    assert raised.count(SubmissionInFlight) == 5
+    assert ledger.outcome("req-1") is None
+
+
+def test_keys_racing_against_each_other_each_send_once():
+    ledger = Submissions()
+    sender = Sender(delay=0.01)
+
+    outcomes, errors = race(
+        6, lambda i: ledger.submit(f"req-{i}", make(id=f"w-{i}"), sender)
+    )
+
+    assert not errors
+    assert sender.calls == 6
+    assert len({outcome.id for outcome in outcomes}) == 6
