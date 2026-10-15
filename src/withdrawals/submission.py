@@ -6,10 +6,15 @@ later call under that key returns the outcome the first one produced, so the
 rail is never touched twice. A key that comes back with a different withdrawal
 behind it is a conflict, not a second payment.
 
+A key protects a retry, not against a second client sending the same
+withdrawal. The ledger indexes the withdrawal id to the key that claimed it:
+submitting or resolving an id under a second key is a conflict naming the first
+one, and releasing a key frees its id again.
+
 The ledger lives in the process that owns it. A send that raises leaves its key
 claimed rather than free, because nobody knows yet whether the rail saw it:
 `resolve` closes such a key once it has been reconciled, and `release` gives it
-back when it is certain nothing moved.
+back, together with the withdrawal it held, when it is certain nothing moved.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ _Fingerprint = tuple[str, Decimal, str, str]
 
 
 class IdempotencyConflict(WithdrawalError):
-    """A request key was reused for something other than what it recorded."""
+    """A request key and the withdrawal behind it contradict the ledger."""
 
 
 class SubmissionInFlight(WithdrawalError):
@@ -48,13 +53,14 @@ class _Record:
 
 
 class Submissions:
-    """A ledger of request keys and the outcome each one produced."""
+    """A ledger of request keys, the withdrawal each claimed and its outcome."""
 
-    __slots__ = ("_lock", "_records")
+    __slots__ = ("_claims", "_lock", "_records")
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._records: dict[str, _Record] = {}
+        self._claims: dict[str, str] = {}
 
     def submit(
         self,
@@ -91,6 +97,13 @@ class Submissions:
             record = self._records.get(key)
             return None if record is None else record.outcome
 
+    def claimed_by(self, withdrawal_id: str) -> str | None:
+        """The request key that claimed `withdrawal_id`, or None."""
+        if not isinstance(withdrawal_id, str) or not withdrawal_id.strip():
+            raise ValueError("withdrawal id must be a non-empty string")
+        with self._lock:
+            return self._claims.get(withdrawal_id)
+
     def resolve(self, key: str, outcome: WithdrawalRequest) -> WithdrawalRequest:
         """Record what `key` produced, so later retries replay it."""
         key = _require_key(key)
@@ -100,6 +113,7 @@ class Submissions:
         with self._lock:
             record = self._records.get(key)
             if record is None:
+                self._claim_id(key, outcome.id)
                 self._records[key] = _Record(fingerprint, outcome)
             elif record.fingerprint != fingerprint:
                 raise IdempotencyConflict(
@@ -124,10 +138,14 @@ class Submissions:
         key = _require_key(key)
         with self._lock:
             record = self._records.get(key)
-            if record is not None and record.outcome is not None:
-                raise IdempotencyConflict(
-                    f"request key {key} already produced an outcome"
-                )
+            if record is not None:
+                if record.outcome is not None:
+                    raise IdempotencyConflict(
+                        f"request key {key} already produced an outcome"
+                    )
+                withdrawal_id = record.fingerprint[0]
+                if self._claims.get(withdrawal_id) == key:
+                    del self._claims[withdrawal_id]
             self._records.pop(key, None)
         logger.info("submission %s released", key)
 
@@ -137,6 +155,7 @@ class Submissions:
         with self._lock:
             record = self._records.get(key)
             if record is None:
+                self._claim_id(key, request_id)
                 self._records[key] = _Record(fingerprint)
                 return None
             if record.fingerprint != fingerprint:
@@ -150,6 +169,14 @@ class Submissions:
             outcome = record.outcome
         logger.info("submission %s replayed for withdrawal %s", key, request_id)
         return outcome
+
+    def _claim_id(self, key: str, withdrawal_id: str) -> None:
+        holder = self._claims.get(withdrawal_id)
+        if holder is not None and holder != key:
+            raise IdempotencyConflict(
+                f"withdrawal {withdrawal_id} is claimed by request key {holder}"
+            )
+        self._claims[withdrawal_id] = key
 
 
 def _fingerprint(request: WithdrawalRequest) -> _Fingerprint:

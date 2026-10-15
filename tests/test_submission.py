@@ -108,12 +108,12 @@ def test_a_retry_replays_the_first_outcome():
     assert sender.calls == 1
 
 
-def test_another_key_sends_again():
+def test_another_withdrawal_under_another_key_sends_again():
     ledger = Submissions()
     sender = Sender()
 
     ledger.submit("req-1", make(), sender)
-    ledger.submit("req-2", make(), sender)
+    ledger.submit("req-2", make(id="w-1042"), sender)
 
     assert sender.calls == 2
 
@@ -136,6 +136,51 @@ def test_reusing_a_key_for_another_withdrawal_is_a_conflict():
         ledger.submit("req-1", make(amount=Decimal("26.00")), sender)
 
     assert sender.calls == 1
+
+
+def test_a_second_key_for_a_claimed_withdrawal_is_a_conflict():
+    ledger = Submissions()
+    sender = Sender()
+    ledger.submit("req-1", make(), sender)
+
+    with pytest.raises(IdempotencyConflict) as conflict:
+        ledger.submit("req-2", make(), sender)
+
+    assert "req-1" in str(conflict.value)
+    assert sender.calls == 1
+    assert ledger.outcome("req-2") is None
+
+
+def test_a_second_key_cannot_resolve_a_claimed_withdrawal():
+    ledger = Submissions()
+    ledger.submit("req-1", make(), Sender())
+    found = make().approve().start_sending().mark_sent("0xdeadbeef")
+
+    with pytest.raises(IdempotencyConflict) as conflict:
+        ledger.resolve("req-2", found)
+
+    assert "req-1" in str(conflict.value)
+    assert ledger.outcome("req-2") is None
+
+
+def test_a_claimed_withdrawal_names_the_key_holding_it():
+    ledger = Submissions()
+    ledger.submit("req-1", make(), Sender())
+
+    assert ledger.claimed_by("w-1041") == "req-1"
+    assert ledger.claimed_by("w-1042") is None
+
+
+def test_a_withdrawal_in_flight_is_claimed_as_firmly_as_a_sent_one():
+    ledger = Submissions()
+    sender = Sender()
+    with pytest.raises(RuntimeError):
+        ledger.submit("req-1", make(), boom)
+
+    with pytest.raises(IdempotencyConflict):
+        ledger.submit("req-2", make(), sender)
+
+    assert sender.calls == 0
 
 
 def test_without_a_send_the_request_is_recorded_as_it_stands():
@@ -194,12 +239,28 @@ def test_releasing_a_claimed_key_allows_a_retry():
     assert outcome.state is WithdrawalState.SENT
 
 
+def test_releasing_a_key_frees_the_withdrawal_for_another_key():
+    ledger = Submissions()
+    sender = Sender()
+    with pytest.raises(RuntimeError):
+        ledger.submit("req-1", make(), boom)
+
+    ledger.release("req-1")
+
+    assert ledger.claimed_by("w-1041") is None
+    assert ledger.submit("req-2", make(), sender).state is WithdrawalState.SENT
+    assert ledger.claimed_by("w-1041") == "req-2"
+    assert sender.calls == 1
+
+
 def test_releasing_a_key_that_produced_an_outcome_is_refused():
     ledger = Submissions()
     ledger.submit("req-1", make(), Sender())
 
     with pytest.raises(IdempotencyConflict):
         ledger.release("req-1")
+
+    assert ledger.claimed_by("w-1041") == "req-1"
 
 
 def test_an_unknown_key_has_no_outcome():
@@ -218,6 +279,12 @@ def test_every_entry_point_needs_a_real_key(key):
         ledger.resolve(key, make())
     with pytest.raises(ValueError):
         ledger.release(key)
+
+
+@pytest.mark.parametrize("withdrawal_id", ["", "   ", None, 7])
+def test_a_claim_lookup_needs_a_real_withdrawal_id(withdrawal_id):
+    with pytest.raises(ValueError):
+        Submissions().claimed_by(withdrawal_id)
 
 
 def test_a_send_must_return_a_request():
@@ -260,6 +327,18 @@ def test_two_withdrawals_racing_for_one_key_leave_one_conflict():
     assert sender.calls == 1
     assert len(outcomes) == 1
     assert [type(error) for error in errors] == [IdempotencyConflict]
+
+
+def test_two_keys_racing_for_one_withdrawal_leave_one_send():
+    ledger = Submissions()
+    sender = Sender(delay=0.05)
+
+    outcomes, errors = race(2, lambda i: ledger.submit(f"req-{i}", make(), sender))
+
+    assert sender.calls == 1
+    assert len(outcomes) == 1
+    assert [type(error) for error in errors] == [IdempotencyConflict]
+    assert ledger.claimed_by("w-1041") in {"req-0", "req-1"}
 
 
 def test_a_send_that_raises_under_load_keeps_the_key_from_everyone():

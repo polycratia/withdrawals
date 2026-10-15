@@ -238,11 +238,28 @@ assert again is first
 ```
 
 The same key carrying a different withdrawal raises `IdempotencyConflict`
-instead of paying twice. When the send itself raises, the key stays claimed and
-a retry raises `SubmissionInFlight`, because nobody knows yet whether the rail
-saw it: close it with `resolve(key, outcome)` once it has been reconciled, or
-`release(key)` when it is certain nothing moved. The ledger lives in the
-process that owns it.
+instead of paying twice.
+
+One withdrawal id, one request key. A key protects a retry, not against a
+second client sending the same withdrawal, so the ledger also indexes the
+withdrawal id to the key that claimed it: submitting or resolving an id under a
+second key raises `IdempotencyConflict` naming the first one, and
+`claimed_by(withdrawal_id)` says which key holds it.
+
+```python
+assert submissions.claimed_by(request.id) == "client-req-9f21"
+
+try:
+    submissions.submit("client-req-4c08", request, send)
+except IdempotencyConflict as conflict:
+    assert "client-req-9f21" in str(conflict)
+```
+
+When the send itself raises, the key stays claimed and a retry raises
+`SubmissionInFlight`, because nobody knows yet whether the rail saw it: close it
+with `resolve(key, outcome)` once it has been reconciled, or `release(key)` when
+it is certain nothing moved, which gives the withdrawal id back as well. The
+ledger lives in the process that owns it.
 
 ## Failure paths
 
