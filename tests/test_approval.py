@@ -10,6 +10,7 @@ from withdrawals import (
     ApprovalRule,
     InvalidTransition,
     NotApproved,
+    PolicyMismatch,
     SelfApproval,
     WithdrawalRequest,
     WithdrawalState,
@@ -32,7 +33,7 @@ def make(**changes) -> WithdrawalRequest:
 
 @pytest.fixture
 def policy() -> ApprovalPolicy:
-    return ApprovalPolicy.four_eyes(above=Decimal("1000"))
+    return ApprovalPolicy.four_eyes(above=Decimal("1000"), currency="USDC")
 
 
 def test_a_small_amount_clears_on_one_approval(policy):
@@ -58,6 +59,51 @@ def test_past_the_threshold_it_takes_a_second_pair_of_eyes(policy):
 def test_the_threshold_is_inclusive(policy):
     assert policy.match(Decimal("999.99")).approvals == 1
     assert policy.match(Decimal("1000")).approvals == 2
+
+
+def test_a_policy_names_the_currency_its_thresholds_are_in(policy):
+    assert policy.currency == "USDC"
+    assert ApprovalPolicy.four_eyes(Decimal("1000"), "usdc").currency == "USDC"
+
+
+def test_a_dearer_coin_does_not_clear_on_one_signature(policy):
+    dearer = make(id="w-1043", amount=Decimal("999"), currency="BTC")
+
+    with pytest.raises(PolicyMismatch):
+        approve(dearer, "bob", policy)
+
+    assert dearer.approvals == ()
+    assert dearer.state is WithdrawalState.REQUESTED
+
+
+def test_a_mismatch_refuses_before_an_approval_is_kept(policy):
+    dearer = make(id="w-1043", amount=Decimal("5000"), currency="BTC")
+    waiting = approve(make(amount=Decimal("5000.00")), "bob", policy)
+
+    with pytest.raises(PolicyMismatch):
+        approve(dearer, "bob", policy)
+    with pytest.raises(PolicyMismatch):
+        approve(dearer, "alice", policy)
+
+    assert waiting.approvals[0].approver == "bob"
+    assert dearer.approvals == ()
+
+
+def test_nothing_in_another_currency_leaves_under_this_policy(policy):
+    dearer = make(id="w-1043", amount=Decimal("999"), currency="BTC")
+    signed = approve(
+        dearer, "bob", ApprovalPolicy.four_eyes(Decimal("1000"), "BTC")
+    )
+
+    assert signed.state is WithdrawalState.APPROVED
+    with pytest.raises(PolicyMismatch):
+        ensure_approved(signed, policy)
+
+
+@pytest.mark.parametrize("currency", ["", "x", "$", "US DC", "toolongaticker", None, 7])
+def test_a_policy_needs_a_currency(currency):
+    with pytest.raises(ValueError):
+        ApprovalPolicy([ApprovalRule(name="everything", approvals=1)], currency)
 
 
 def test_an_approval_carries_who_and_when(policy):
@@ -131,7 +177,9 @@ def test_nothing_leaves_without_the_approvals_its_policy_asks_for(policy):
 
 def test_a_tightened_policy_catches_an_old_approval(policy):
     approved = approve(make(), "bob", policy)
-    stricter = ApprovalPolicy([ApprovalRule(name="everything", approvals=2)])
+    stricter = ApprovalPolicy(
+        [ApprovalRule(name="everything", approvals=2)], currency="USDC"
+    )
 
     assert ensure_approved(approved, policy) is approved
     with pytest.raises(NotApproved):
@@ -140,7 +188,10 @@ def test_a_tightened_policy_catches_an_old_approval(policy):
 
 def test_a_policy_needs_a_rule_that_starts_at_zero():
     with pytest.raises(ValueError):
-        ApprovalPolicy([ApprovalRule(name="big", approvals=2, at_least=Decimal("10"))])
+        ApprovalPolicy(
+            [ApprovalRule(name="big", approvals=2, at_least=Decimal("10"))],
+            currency="USDC",
+        )
 
 
 def test_two_rules_cannot_start_at_the_same_amount():
@@ -149,13 +200,14 @@ def test_two_rules_cannot_start_at_the_same_amount():
             [
                 ApprovalRule(name="one", approvals=1),
                 ApprovalRule(name="two", approvals=2),
-            ]
+            ],
+            currency="USDC",
         )
 
 
 def test_an_empty_policy_is_refused():
     with pytest.raises(ValueError):
-        ApprovalPolicy([])
+        ApprovalPolicy([], currency="USDC")
 
 
 def test_a_rule_must_ask_for_at_least_one_approval():

@@ -163,7 +163,7 @@ space, so the same address written two ways lands on the same account.
 | Hold vault | `release(withdrawal_id) -> bool` | `broadcast`, `cancel`, `return_funds` |
 | The send | a callable taking a request and returning the request it produced | `broadcast`, `Submissions.submit` |
 | Request key | a string the client chooses and repeats on retries | `Submissions` |
-| Approval policy | `ApprovalPolicy` | `approve`, `ensure_approved` |
+| Approval policy | `ApprovalPolicy`, in the currency of the withdrawals it measures | `approve`, `ensure_approved` |
 | Stuck policy | `StuckPolicy` | `review` |
 | `sent_at` | timezone-aware `datetime` of the broadcast | `review` |
 
@@ -182,7 +182,7 @@ the rule with the highest threshold the amount clears is the one that applies.
 ```python
 from withdrawals import ApprovalPolicy, approve, ensure_approved
 
-policy = ApprovalPolicy.four_eyes(above=Decimal("1000"))
+policy = ApprovalPolicy.four_eyes(above=Decimal("1000"), currency="USDC")
 
 large = WithdrawalRequest(
     id="w-1042",
@@ -201,6 +201,29 @@ assert approved.approvers == ("bob", "carol")
 assert approved.approvals[0].policy == "four-eyes"
 ```
 
+Thresholds are amounts of a currency, not bare numbers. A policy names the one
+its rules are written in, and both `approve` and `ensure_approved` refuse a
+withdrawal in another currency with `PolicyMismatch` before a single signature
+is kept — so a four-eyes rule set at 1000 of a stablecoin never lets 999 of a
+dearer coin out on one signature:
+
+```python
+from withdrawals import PolicyMismatch
+
+dearer = WithdrawalRequest(
+    id="w-1043",
+    amount=Decimal("999"),
+    currency="BTC",
+    destination="0xab5801a7d398351b8be11c439e05c5b3259aec9b",
+    requested_by="alice",
+)
+
+try:
+    approve(dearer, "bob", policy)
+except PolicyMismatch:
+    assert dearer.approvals == ()
+```
+
 Every approval names who gave it, when they gave it (timezone-aware) and the
 rule that was in force at the time, and it travels with the request all the way
 to `confirmed`. The person who asked for the money cannot be one of the
@@ -209,8 +232,8 @@ so a click that arrives twice never becomes a second pair of eyes.
 
 `request.approve()` is the bare state move; `approve(request, who, policy)` is
 the one that asks the policy first. Build your own rules with `ApprovalRule`
-when two tiers are not enough — a policy needs one rule starting at zero, so
-that every amount matches exactly one.
+when two tiers are not enough — a policy needs a currency and one rule starting
+at zero, so that every amount in that currency matches exactly one rule.
 
 Before handing a request to a rail, `ensure_approved(request, policy)` measures
 it against the policy again and raises `NotApproved` when the signatures behind

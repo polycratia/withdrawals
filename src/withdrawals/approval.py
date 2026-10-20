@@ -5,6 +5,10 @@ at and the number of distinct people it asks for: small withdrawals clear on a
 single signature, anything past the threshold needs a second pair of eyes, and
 the person who asked for the money is never one of them.
 
+Thresholds are amounts of a currency, not bare numbers. A policy names the
+currency it is written in and refuses a withdrawal in another one, so a rule
+set at a thousand of a stablecoin never clears a thousand of a dearer coin.
+
 Every approval is kept with the request — who gave it, when, and which rule was
 in force at the time. The same approver recorded twice counts once, so a click
 that arrives twice never becomes a second pair of eyes.
@@ -24,6 +28,7 @@ __all__ = [
     "ApprovalPolicy",
     "ApprovalRule",
     "NotApproved",
+    "PolicyMismatch",
     "SelfApproval",
     "approve",
     "ensure_approved",
@@ -34,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 class NotApproved(WithdrawalError):
     """A withdrawal was about to leave without the approvals it needs."""
+
+
+class PolicyMismatch(WithdrawalError):
+    """A policy was measured against a withdrawal in another currency."""
 
 
 class SelfApproval(WithdrawalError):
@@ -67,11 +76,21 @@ class ApprovalRule:
 
 
 class ApprovalPolicy:
-    """The rules in force, read from the highest threshold down."""
+    """The rules in force, read from the highest threshold down.
 
-    __slots__ = ("_rules",)
+    The thresholds are amounts of `currency`; a withdrawal in another one is
+    not something this policy can measure.
+    """
 
-    def __init__(self, rules: Iterable[ApprovalRule]) -> None:
+    __slots__ = ("_currency", "_rules")
+
+    def __init__(self, rules: Iterable[ApprovalRule], currency: str) -> None:
+        if (
+            not isinstance(currency, str)
+            or not currency.isalnum()
+            or not 2 <= len(currency) <= 12
+        ):
+            raise ValueError("currency must be an alphanumeric ticker")
         given = tuple(rules)
         for rule in given:
             if not isinstance(rule, ApprovalRule):
@@ -85,7 +104,13 @@ class ApprovalPolicy:
             raise ValueError(
                 "a policy needs a rule starting at zero, so every amount matches"
             )
+        self._currency: str = currency.upper()
         self._rules: tuple[ApprovalRule, ...] = tuple(ordered)
+
+    @property
+    def currency(self) -> str:
+        """The currency the thresholds are amounts of."""
+        return self._currency
 
     @property
     def rules(self) -> tuple[ApprovalRule, ...]:
@@ -93,20 +118,30 @@ class ApprovalPolicy:
         return self._rules
 
     def match(self, amount: Decimal) -> ApprovalRule:
-        """The rule that decides `amount`."""
+        """The rule that decides `amount`, read as an amount of `currency`."""
         for rule in self._rules[:-1]:
             if amount >= rule.at_least:
                 return rule
         return self._rules[-1]
 
+    def rule_for(self, request: WithdrawalRequest) -> ApprovalRule:
+        """The rule that decides `request`, or refuse another currency."""
+        if request.currency != self._currency:
+            raise PolicyMismatch(
+                f"withdrawal {request.id} is in {request.currency} and this "
+                f"policy measures amounts of {self._currency}"
+            )
+        return self.match(request.amount)
+
     @classmethod
-    def four_eyes(cls, above: Decimal) -> ApprovalPolicy:
-        """One signature up to `above`, two distinct people beyond it."""
+    def four_eyes(cls, above: Decimal, currency: str) -> ApprovalPolicy:
+        """One signature up to `above` of `currency`, two distinct people beyond."""
         return cls(
             [
                 ApprovalRule(name="single-approver", approvals=1),
                 ApprovalRule(name="four-eyes", approvals=2, at_least=above),
-            ]
+            ],
+            currency=currency,
         )
 
 
@@ -118,7 +153,7 @@ def approve(
     at: datetime | None = None,
 ) -> WithdrawalRequest:
     """Record one approval, and approve the request once the policy is met."""
-    rule = policy.match(request.amount)
+    rule = policy.rule_for(request)
     approval = Approval(
         approver=approver,
         at=datetime.now(timezone.utc) if at is None else at,
@@ -160,7 +195,7 @@ def ensure_approved(
     request: WithdrawalRequest, policy: ApprovalPolicy
 ) -> WithdrawalRequest:
     """Return `request` if `policy` is satisfied, or refuse to let it leave."""
-    rule = policy.match(request.amount)
+    rule = policy.rule_for(request)
     if len(request.approvals) < rule.approvals:
         raise NotApproved(
             f"withdrawal {request.id} carries {len(request.approvals)} "
