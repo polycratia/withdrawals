@@ -7,9 +7,12 @@ Replaying a transition that already happened returns the same value, so a
 callback delivered twice changes nothing.
 
 Approvals travel with the request: each one names who gave it, when they gave
-it and which policy rule was in force at the time. A transaction that has to be
-replaced travels with it too: the reference that got stuck moves to `replaced`,
-so a bumped or cancelled send keeps the attempts behind it.
+it and which policy rule was in force at the time. The rail travels with it as
+well, once `routed` has kept the routing decision, so every later step knows
+whether the money moves on our own books or on a chain, and a ledger move can
+refuse what only a transaction can do. A transaction that has to be replaced
+travels with it too: the reference that got stuck moves to `replaced`, so a
+bumped or cancelled send keeps the attempts behind it.
 """
 
 from __future__ import annotations
@@ -18,11 +21,15 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from withdrawals.routing import Route
 
 __all__ = [
     "Approval",
     "InvalidTransition",
+    "Rail",
     "WithdrawalError",
     "WithdrawalRequest",
     "WithdrawalState",
@@ -35,6 +42,16 @@ class WithdrawalError(Exception):
 
 class InvalidTransition(WithdrawalError):
     """A transition the state machine does not allow was attempted."""
+
+
+class Rail(str, Enum):
+    """The two ways a withdrawal can leave the account it came from."""
+
+    INTERNAL = "internal"
+    EXTERNAL = "external"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class WithdrawalState(str, Enum):
@@ -117,6 +134,7 @@ class WithdrawalRequest:
     requested_by: str | None = None
     approvals: tuple[Approval, ...] = ()
     replaced: tuple[str, ...] = ()
+    rail: Rail | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id.strip():
@@ -147,6 +165,8 @@ class WithdrawalRequest:
             raise ValueError("a reference cannot be current and replaced at once")
         object.__setattr__(self, "currency", self.currency.upper())
         object.__setattr__(self, "state", WithdrawalState(self.state))
+        if self.rail is not None:
+            object.__setattr__(self, "rail", Rail(self.rail))
 
     @property
     def is_terminal(self) -> bool:
@@ -170,6 +190,19 @@ class WithdrawalRequest:
                 f"and takes no further approvals"
             )
         return replace(self, approvals=self.approvals + (approval,))
+
+    def routed(self, route: Route | Rail) -> WithdrawalRequest:
+        """Keep the rail a routing decision chose, so later steps carry it."""
+        rail = getattr(route, "rail", route)
+        if not isinstance(rail, Rail):
+            raise TypeError("routed takes a Route or a Rail")
+        if self.rail is rail:
+            return self
+        if self.rail is not None:
+            raise InvalidTransition(
+                f"withdrawal {self.id} already travels {self.rail}"
+            )
+        return replace(self, rail=rail)
 
     def approve(self) -> WithdrawalRequest:
         if self.state is WithdrawalState.APPROVED:
@@ -198,6 +231,11 @@ class WithdrawalRequest:
     def bump(self, reference: str) -> WithdrawalRequest:
         """Put a replacement in front of a transaction that is not moving."""
         reference = _require_text(reference, "reference")
+        if self.rail is Rail.INTERNAL:
+            raise InvalidTransition(
+                f"withdrawal {self.id} is a ledger move "
+                f"and has no transaction to replace"
+            )
         if self.state is not WithdrawalState.SENT:
             raise InvalidTransition(
                 f"withdrawal {self.id} is {self.state} "

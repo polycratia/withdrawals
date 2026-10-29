@@ -1,20 +1,30 @@
 import logging
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
 from withdrawals import (
     Custody,
+    Hold,
     InMemoryCustody,
+    InMemoryHolds,
+    InvalidTransition,
     Rail,
     Route,
+    StuckPolicy,
     WithdrawalRequest,
+    WithdrawalState,
+    bump,
+    cancel,
+    review,
     route,
 )
 
 OURS = "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f"
 ALSO_OURS = "0x742d35cc6634c0532925a3b844bc454e4438f44e"
 THEIRS = "0xab5801a7d398351b8be11c439e05c5b3259aec9b"
+SENT_AT = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
 
 
 def make(**changes) -> WithdrawalRequest:
@@ -26,6 +36,11 @@ def make(**changes) -> WithdrawalRequest:
     }
     fields.update(changes)
     return WithdrawalRequest(**fields)
+
+
+def routed(custody, destination: str = OURS) -> WithdrawalRequest:
+    request = make(destination=destination)
+    return request.routed(route(request, custody))
 
 
 @pytest.fixture
@@ -76,6 +91,72 @@ def test_an_internal_decision_names_the_account_it_credits(custody):
     decision = route(make(destination=ALSO_OURS), custody)
 
     assert "acct-88" in decision.reason
+
+
+@pytest.mark.parametrize(("destination", "rail", "account"), DESTINATIONS)
+def test_the_route_travels_with_the_request(custody, destination, rail, account):
+    request = routed(custody, destination)
+
+    assert request.rail is rail
+    assert request.approve().start_sending().rail is rail
+
+
+def test_an_internal_request_confirms_directly(custody):
+    booked = routed(custody).approve().start_sending().mark_sent("ledger-7")
+
+    confirmed = booked.confirm()
+
+    assert confirmed.state is WithdrawalState.CONFIRMED
+    assert confirmed.reference == "ledger-7"
+    assert confirmed.rail is Rail.INTERNAL
+
+
+def test_a_ledger_move_refuses_review(custody):
+    booked = routed(custody).approve().start_sending().mark_sent("ledger-7")
+    policy = StuckPolicy(bump_after=timedelta(minutes=10), cancel_after=timedelta(hours=2))
+
+    with pytest.raises(InvalidTransition):
+        review(booked, sent_at=SENT_AT, policy=policy, now=SENT_AT + timedelta(hours=3))
+
+
+def test_a_ledger_move_refuses_a_bump(custody):
+    booked = routed(custody).approve().start_sending().mark_sent("ledger-7")
+
+    with pytest.raises(InvalidTransition):
+        bump(booked, "ledger-8")
+
+
+def test_a_ledger_move_refuses_a_cancel_and_keeps_its_hold(custody):
+    booked = routed(custody).approve().start_sending().mark_sent("ledger-7")
+    holds = InMemoryHolds([Hold.on(booked)])
+
+    with pytest.raises(InvalidTransition):
+        cancel(booked, "ledger-8", holds, reason="stuck for two hours")
+
+    assert holds.held(booked.id) is not None
+
+
+def test_routing_the_same_way_twice_changes_nothing(custody):
+    request = routed(custody)
+
+    assert request.routed(route(request, custody)) is request
+
+
+def test_routing_a_request_the_other_way_is_a_conflict(custody):
+    request = routed(custody)
+
+    with pytest.raises(InvalidTransition):
+        request.routed(route(request, InMemoryCustody({})))
+
+
+def test_a_bare_rail_is_kept_as_well():
+    assert make().routed(Rail.EXTERNAL).rail is Rail.EXTERNAL
+
+
+@pytest.mark.parametrize("given", ["internal", None, 7])
+def test_routing_needs_a_decision_or_a_rail(given):
+    with pytest.raises(TypeError):
+        make().routed(given)
 
 
 class SingleAccount:

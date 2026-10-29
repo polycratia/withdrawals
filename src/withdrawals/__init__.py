@@ -12,6 +12,7 @@ from withdrawals.approval import (
 from withdrawals.models import (
     Approval,
     InvalidTransition,
+    Rail,
     WithdrawalError,
     WithdrawalRequest,
     WithdrawalState,
@@ -31,7 +32,7 @@ from withdrawals.recovery import (
     return_funds,
     review,
 )
-from withdrawals.routing import Custody, InMemoryCustody, Rail, Route, route
+from withdrawals.routing import Custody, InMemoryCustody, Route, route
 from withdrawals.submission import (
     IdempotencyConflict,
     SubmissionInFlight,

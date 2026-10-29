@@ -10,6 +10,9 @@ deadline it is replaced by one the chain will take; past the cancel deadline,
 or once it has been bumped as often as the policy allows, it is replaced by one
 that returns the funds. The decision is a value the caller keeps, and it is
 logged when it is taken.
+
+None of that reaches a ledger move: a request routed internally has no
+transaction to replace, so `review`, `bump` and `cancel` refuse it.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from typing import Protocol, runtime_checkable
 
 from withdrawals.models import (
     InvalidTransition,
+    Rail,
     WithdrawalError,
     WithdrawalRequest,
     WithdrawalState,
@@ -243,6 +247,7 @@ def review(
     now: datetime | None = None,
 ) -> Recovery:
     """Decide what a transaction that has not confirmed yet needs."""
+    _on_a_chain(request)
     if request.state is not WithdrawalState.SENT:
         raise InvalidTransition(
             f"withdrawal {request.id} is {request.state}, "
@@ -303,8 +308,17 @@ def cancel(
     reason: str = "the transaction was cancelled before it confirmed",
 ) -> WithdrawalRequest:
     """Replace a stuck transaction with one that returns the funds."""
+    _on_a_chain(request)
     replacement = request if request.reference == reference else request.bump(reference)
     return return_funds(replacement, reason, holds)
+
+
+def _on_a_chain(request: WithdrawalRequest) -> None:
+    if request.rail is Rail.INTERNAL:
+        raise InvalidTransition(
+            f"withdrawal {request.id} is a ledger move "
+            f"and has no transaction to replace"
+        )
 
 
 def _aware(moment: datetime, name: str) -> datetime:

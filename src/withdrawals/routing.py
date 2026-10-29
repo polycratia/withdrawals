@@ -4,6 +4,9 @@ A destination we custody never reaches a chain. Crediting it is a ledger move:
 no fee, instant, nothing to confirm. Everything else is a transaction on the
 rail the currency lives on. The decision is a value the caller keeps, and it is
 logged when it is taken, so the two paths can always be told apart afterwards.
+
+`request.routed(decision)` puts the rail on the request itself, so the steps
+after routing no longer have to ask custody what kind of transfer they hold.
 """
 
 from __future__ import annotations
@@ -11,10 +14,9 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from withdrawals.models import WithdrawalRequest
+from withdrawals.models import Rail, WithdrawalRequest
 
 __all__ = [
     "Custody",
@@ -25,16 +27,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-
-class Rail(str, Enum):
-    """The two ways a withdrawal can leave the account it came from."""
-
-    INTERNAL = "internal"
-    EXTERNAL = "external"
-
-    def __str__(self) -> str:
-        return self.value
 
 
 @dataclass(frozen=True, slots=True)
