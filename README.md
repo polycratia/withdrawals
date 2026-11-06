@@ -29,7 +29,8 @@ A withdrawal passes through five steps, in this order:
    rule matching the amount is satisfied. `ensure_approved(request, policy)`
    measures them once more immediately before the money moves.
 2. **Route.** `route(request, custody)` decides whether the destination is an
-   address we custody — a ledger move — or one that needs a transaction.
+   address we custody — a ledger move — or one that needs a transaction, and
+   `request.routed(decision)` keeps that rail on the request itself.
 3. **Hold.** Reserve the funds while the request is on its way, so a refusal
    has something to give back.
 4. **Submit.** `submissions.submit(key, request, send)` runs the send once per
@@ -49,6 +50,7 @@ submissions = Submissions()
 def withdraw(request, key, custody, holds, policy, rails):
     ensure_approved(request, policy)
     decision = route(request, custody)
+    request = request.routed(decision)
     holds.place(Hold.on(request))
     send = rails[decision.rail]
     return submissions.submit(
@@ -86,6 +88,8 @@ requested ---> approved ---> sending ---> sent ---> confirmed
 transition leads out of them. Rejection is only possible while the money has
 not moved — past `sending`, the way out is `failed`. Approvals are only
 recorded in `requested`; after that the request carries the ones it left with.
+The rail travels the same way: once `routed` has kept it, every transition
+hands it on.
 
 A request is an immutable value: a transition returns a new request and leaves
 the one it was called on untouched.
@@ -148,7 +152,24 @@ the request may confirm:
 | What moves | a ledger entry against `decision.account` | a transaction on the chain the currency lives on |
 | `mark_sent(reference)` carries | the ledger entry | the transaction hash |
 | `needs_confirmations` | False — confirm once the credit is booked | True — confirm when the chain says so |
-| Stuck transactions | cannot happen | `review`, `bump`, `cancel` |
+| Stuck transactions | cannot happen — `review`, `bump` and `cancel` refuse | `review`, `bump`, `cancel` |
+
+The decision does not have to be carried beside the request:
+`request.routed(decision)` puts the rail on the request itself, and every later
+transition hands it on, so the steps after routing never ask custody again.
+
+```python
+booked = request.routed(decision).approve().start_sending().mark_sent("ledger-7")
+
+assert booked.rail is Rail.INTERNAL
+assert booked.confirm().state is WithdrawalState.CONFIRMED
+```
+
+That is what makes the "cannot happen" above a rule rather than a remark: a
+request routed `INTERNAL` has no transaction to replace, so `review`, `bump`
+and `cancel` raise `InvalidTransition` on it. Routing a request that already
+travels one rail the other way raises `InvalidTransition` too, instead of
+quietly rewriting it; routing it the same way again changes nothing.
 
 Supply your own custody lookup by implementing
 `account_for(destination) -> str | None`. Lookups ignore case and surrounding
@@ -337,7 +358,9 @@ returns the hold. Both are free to repeat: bumping to the reference a request
 already carries returns the same request, and cancelling a cancelled one
 releases nothing a second time. A transaction that has been bumped as often as
 the policy allows is cancelled instead of bumped again, and an old reference
-that comes back after being replaced raises `InvalidTransition`.
+that comes back after being replaced raises `InvalidTransition`. None of the
+three touches a request that travels `INTERNAL`: a ledger move has nothing to
+replace, and a refused cancel leaves its hold where it was.
 
 ## Tests
 
